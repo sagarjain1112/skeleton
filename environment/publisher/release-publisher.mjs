@@ -1,56 +1,43 @@
-import duckdb from 'duckdb';
-import { promisify } from 'util';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { fileURLToPath } from 'url';
+import { promisify } from 'util';
+import { execFileSync } from 'child_process';
+import duckdb from 'duckdb';
 
-/**
- * ReleasePublisherDB handles all interactions with the embedded DuckDB database.
- * This encapsulates data ingestion, reconciliation logic, and persistence.
- */
-export class ReleasePublisherDB {
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const CURRENT_CERT = process.env.CURRENT_CERT || path.resolve(__dirname, '../keys/current/current.cert.pem');
+const CURRENT_KEY = process.env.CURRENT_KEY || path.resolve(__dirname, '../keys/current/current.key.pem');
+const GATEWAY_URL = 'http://127.0.0.1:7070';
+
+class PublisherDB {
   constructor(dbPath = 'releases.duckdb') {
     this.db = new duckdb.Database(dbPath);
-    this.connection = this.db.connect();
-    
-    // Promisify the callback-based duckdb methods for modern async/await usage
-    this.allAsync = promisify(this.connection.all.bind(this.connection));
-    this.execAsync = promisify(this.connection.exec.bind(this.connection));
+    this.conn = this.db.connect();
+    this.query = promisify(this.conn.all.bind(this.conn));
+    this.exec = promisify(this.conn.exec.bind(this.conn));
   }
 
-  /**
-   * Initializes the database schema, loads the raw manifest, and builds the
-   * reconciliation views to determine valid publishable bundles.
-   */
-  async initialize(manifestPath = 'fixtures/build_manifest.csv') {
-    // Drop existing table to ensure idempotency across runs
-    await this.execAsync(`DROP TABLE IF EXISTS raw_manifest;`);
+  async setup(manifest = 'fixtures/build_manifest.csv') {
+    await this.exec('DROP TABLE IF EXISTS raw_manifest;');
     
-    // 1. Ingest: Load CSV into raw_manifest
-    await this.execAsync(`
-      CREATE TABLE raw_manifest AS 
-      SELECT * FROM read_csv_auto('${manifestPath}');
+    await this.exec(`
+      CREATE TABLE raw_manifest AS SELECT * FROM read_csv_auto('${manifest}');
     `);
 
-    // 2. Deduplicate: Collapse exact duplicates
-    await this.execAsync(`
-      CREATE OR REPLACE VIEW distinct_manifest AS 
-      SELECT DISTINCT * FROM raw_manifest;
-    `);
-
-    // 3. Filter: Isolate active builds by applying withdrawals
-    await this.execAsync(`
+    await this.exec(`
       CREATE OR REPLACE VIEW active_builds AS
-      SELECT * FROM distinct_manifest
+      SELECT * FROM (SELECT DISTINCT * FROM raw_manifest)
       WHERE record_type = 'BUILD'
         AND entry_id NOT IN (
-          SELECT supersedes_id 
-          FROM distinct_manifest 
-          WHERE record_type = 'WITHDRAWAL' AND supersedes_id IS NOT NULL
+          SELECT supersedes_id FROM raw_manifest WHERE record_type = 'WITHDRAWAL' AND supersedes_id IS NOT NULL
         );
     `);
 
-    // 4. Aggregate: Group by bundle to calculate final metrics
-    // Note: CAST to INTEGER avoids JS BigInt serialization issues later in canonicalization
-    await this.execAsync(`
+    await this.exec(`
       CREATE OR REPLACE VIEW publishable_bundles AS
       SELECT 
           bundle_id, 
@@ -61,61 +48,129 @@ export class ReleasePublisherDB {
       HAVING COUNT(*) > 0 
       ORDER BY bundle_id ASC;
     `);
+
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS receipts (
+        bundle_id VARCHAR PRIMARY KEY,
+        publication_id VARCHAR,
+        request_token VARCHAR
+      );
+    `);
   }
 
-  /**
-   * Retrieves all publishable bundles computed by the reconciliation logic.
-   * @returns {Promise<Array>} Array of objects with bundle_id, artifact_count, total_bytes
-   */
-  async getPublishableBundles() {
-    return await this.allAsync(`SELECT * FROM publishable_bundles;`);
+  async getBundles() {
+    return this.query('SELECT * FROM publishable_bundles;');
   }
 
-  /**
-   * Safely closes the database connection.
-   */
-  async close() {
-    return new Promise((resolve, reject) => {
-      this.connection.close();
-      this.db.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+  async getReceipt(bundleId) {
+    const rows = await this.query('SELECT * FROM receipts WHERE bundle_id = ?;', bundleId);
+    return rows.length ? rows[0] : null;
+  }
+
+  async saveReceipt(bundleId, pubId, token) {
+    await this.exec(`
+      INSERT INTO receipts (bundle_id, publication_id, request_token)
+      VALUES ('${bundleId}', '${pubId}', '${token}')
+      ON CONFLICT (bundle_id) DO UPDATE SET 
+        publication_id = excluded.publication_id,
+        request_token = excluded.request_token;
+    `);
+  }
+
+  close() {
+    return new Promise((resolve) => {
+      this.conn.close();
+      this.db.close(() => resolve());
     });
   }
 }
 
-/**
- * Main execution block
- */
-async function main() {
-  // Using '--report' check for future steps, though not strictly required for Step 1
-  const isReportMode = process.argv.includes('--report');
+async function getKeyInfo() {
+  const res = await fetch(`${GATEWAY_URL}/v1/signing-key/current`);
+  if (!res.ok) throw new Error(`Gateway returned ${res.status}`);
+  return res.json();
+}
+
+function canonicalEncode(bundle) {
+  // Ensure strict ordering for the signature payload
+  const obj = {
+    artifact_count: bundle.artifact_count,
+    bundle_id: bundle.bundle_id,
+    total_bytes: bundle.total_bytes
+  };
   
-  const publisherDb = new ReleasePublisherDB();
+  const sorted = {};
+  for (const k of Object.keys(obj).sort()) {
+    sorted[k] = obj[k];
+  }
+  return JSON.stringify(sorted);
+}
+
+function sign(payload) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cms-'));
+  const payloadFile = path.join(tmpDir, 'payload.bin');
   
   try {
-    console.log('Initializing database and reconciling manifest...');
-    await publisherDb.initialize();
-    
-    const bundles = await publisherDb.getPublishableBundles();
-    
-    console.log('\n--- Step 1: Reconciled Publishable Bundles ---');
-    console.table(bundles);
-    console.log('\nReconciliation complete. Ready for Step 2.');
-    
+    fs.writeFileSync(payloadFile, payload);
+    const out = execFileSync(
+      'openssl',
+      ['cms', '-sign', '-in', payloadFile, '-signer', CURRENT_CERT, '-inkey', CURRENT_KEY, '-outform', 'PEM', '-binary']
+    );
+    return out.toString('utf8');
   } catch (err) {
-    console.error('Error during database initialization/reconciliation:', err);
-    process.exit(1);
+    throw new Error(`Signing failed: ${err.stderr ? err.stderr.toString() : err.message}`);
   } finally {
-    await publisherDb.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-// Execute main if run directly (not imported as a module)
-const __filename = fileURLToPath(import.meta.url);
-const isMainModule = process.argv[1] === __filename;
+async function publish(descriptor, signature, token) {
+  const res = await fetch(`${GATEWAY_URL}/v1/publications`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ descriptor, signature, request_token: token })
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
 
-if (isMainModule) {
-  main();
+async function run() {
+  const db = new PublisherDB();
+  
+  try {
+    await db.setup();
+    const keyInfo = await getKeyInfo();
+    const bundles = await db.getBundles();
+    
+    for (const b of bundles) {
+      const descriptor = canonicalEncode(b);
+      const signature = sign(descriptor);
+      const token = `token-${b.bundle_id}`;
+      
+      console.log(`BUNDLE ${b.bundle_id} SIGNED KEY=${keyInfo.key_id}`);
+      
+      let receipt = await db.getReceipt(b.bundle_id);
+      
+      if (!receipt) {
+        const result = await publish(descriptor, signature, token);
+        receipt = {
+          publication_id: result.publication_id,
+          request_token: token
+        };
+        await db.saveReceipt(b.bundle_id, receipt.publication_id, receipt.request_token);
+      }
+      
+      console.log(`BUNDLE ${b.bundle_id} PUBLISHED RECEIPT=${receipt.publication_id} TOKEN=${receipt.request_token} STATUS=PUBLISHED`);
+    }
+  } catch (e) {
+    console.error('Fatal error:', e.message);
+    process.exit(1);
+  } finally {
+    await db.close();
+  }
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run();
 }
